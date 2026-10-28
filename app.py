@@ -53,10 +53,10 @@ def _load_saved(key: tuple):
 
 def _scan_job(key: tuple, job: dict):
     """รันสแกนใน background thread — ไม่หยุดแม้ผู้ใช้กดปุ่ม/เปลี่ยนหน้า"""
-    quick, min_cap, max_sector, translate = key
+    quick, min_cap, max_sector, translate, include_mid = key
     try:
         res = sp.run_scan(quick=quick, top=20, min_cap=min_cap, max_per_sector=max_sector, workers=2,
-                          translate=translate, progress=lambda f, m: job.update(frac=f, msg=m))
+                          translate=translate, include_mid=include_mid, progress=lambda f, m: job.update(frac=f, msg=m))
         res["ts"] = res["ts_data"] = time.time()
         old = store()["results"].get(key) or _load_saved(key)
         # ถ้ารอบใหม่ได้งบการเงินน้อยกว่ารอบเก่ามาก (Yahoo บล็อก) ให้คงผลเดิมไว้ แต่ใช้ราคา/ทดสอบย้อนหลังใหม่ไม่ได้
@@ -132,7 +132,12 @@ def get_results(key: tuple, force: bool):
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("⚙️ ตั้งค่า")
-    universe = st.radio("กลุ่มหุ้นที่สแกน", ["S&P 500 + Nasdaq-100 (~520 ตัว)", "บริษัทใหญ่ ~200 ตัว (เร็วกว่า)"])
+    universe = st.radio("กลุ่มหุ้นที่สแกน", ["S&P 500 + Nasdaq-100 (~520 ตัว)",
+                                              "+ หุ้นขนาดกลาง S&P 400 (~920 ตัว, ช้ากว่า)",
+                                              "บริษัทใหญ่ ~200 ตัว (เร็วกว่า)"])
+    if universe.startswith("+"):
+        st.caption("หุ้นขนาดกลางมักมีมูลค่า 2–15 พันล้าน USD — ลดมูลค่าตลาดขั้นต่ำเป็น 2 ด้วย "
+                   "เหมาะกับแท็บ 💎 เพราะหุ้นที่ตลาดยังไม่รับรู้มักอยู่ในกลุ่มนี้")
     min_cap_b = st.select_slider("มูลค่าตลาดขั้นต่ำ (พันล้าน USD)", options=[2, 5, 10, 20, 50, 100], value=10)
     max_sector = st.slider("จำกัดหุ้นต่อกลุ่มธุรกิจ (กระจายความเสี่ยง)", 2, 10, 4)
     translate = st.toggle("แปลคำอธิบายธุรกิจเป็นภาษาไทย", value=True)
@@ -140,7 +145,8 @@ with st.sidebar:
     st.caption(f"ผลสแกนเก็บไว้ {CACHE_HOURS} ชั่วโมงแล้วอัปเดตอัตโนมัติ · "
                "ราคา Yahoo ดีเลย์ประมาณ 15 นาทีระหว่างตลาดเปิด (ตลาด US เปิด ~20:30–03:00 น. เวลาไทย)")
 
-key = (universe.startswith("บริษัทใหญ่"), float(min_cap_b) * 1e9, int(max_sector), bool(translate))
+key = (universe.startswith("บริษัทใหญ่"), float(min_cap_b) * 1e9, int(max_sector), bool(translate),
+       universe.startswith("+"))
 res = get_results(key, force)
 scored, picks, meta, desc_th = res["scored"], res["picks"], res["meta"], res["desc_th"]
 
@@ -310,6 +316,8 @@ def summary_table(top: pd.DataFrame, col: str, key_h: str = ""):
             "คะแนน": r[col],
             **({"คุณภาพ": r["s_quality"], "เติบโตข้างหน้า": r["s_fwd"], "โมเมนตัม": r["s_mom"],
                 "ความคุ้มค่า": r["s_value"]} if key_h == "buy" else
+               {"คุณภาพ": r["s_quality"], "ความคุ้มค่า": r["s_value"], "เติบโตข้างหน้า": r["s_fwd"],
+                "ถูกมองข้าม": r["s_unloved"]} if key_h == "gem" else
                {"Technical": r["s_tech_short"], "คุณภาพ": r["s_quality"], "เติบโต": r["s_growth"],
                 "ข่าว": r["s_news"]}),
         })
@@ -321,7 +329,7 @@ def summary_table(top: pd.DataFrame, col: str, key_h: str = ""):
         "1 ปี": st.column_config.NumberColumn("1 ปี %", format="%+.1f"),
         "คะแนน": pc("คะแนนรวม"), "Technical": pc("Technical"), "คุณภาพ": pc("คุณภาพ"),
         "เติบโต": pc("เติบโต"), "ข่าว": pc("ข่าว"), "เติบโตข้างหน้า": pc("เติบโตข้างหน้า"),
-        "โมเมนตัม": pc("โมเมนตัม"), "ความคุ้มค่า": pc("ความคุ้มค่า"),
+        "โมเมนตัม": pc("โมเมนตัม"), "ความคุ้มค่า": pc("ความคุ้มค่า"), "ถูกมองข้าม": pc("ถูกมองข้าม"),
     })
 
 
@@ -340,6 +348,14 @@ for tab, (key_h, col, label, method) in zip(tabs[:NH], sp.HORIZONS):
                 "เลือก 5–10 ตัวที่คุณ**เข้าใจธุรกิจ** (กดชื่อหุ้นเพื่ออ่าน) · ทยอยซื้อ (DCA) ไม่ซื้อทีเดียว · "
                 "แบ่งเงินเท่า ๆ กัน · ให้ส่วนนี้เป็นเงินส่วนเสริม ส่วนหลักยังเป็นกองทุนดัชนี S&P 500 · "
                 "ทบทวนทุก 3–6 เดือน ไม่ต้องเปลี่ยนตามอันดับทุกวัน")
+        if key_h == "gem":
+            st.warning(
+                "**อ่านก่อนใช้:** หุ้นในลิสต์นี้ราคายังไม่วิ่งทั้งที่ตัวเลขดี ซึ่งเป็นได้ 2 แบบ — "
+                "(1) ตลาดยังมองข้ามจริง หรือ (2) ตลาดรู้ปัญหาบางอย่างที่ตัวเลขยังไม่สะท้อน (value trap) "
+                "· กดชื่อหุ้นแล้วอ่านข่าว ว่าทำไมราคาไม่ขึ้น · หุ้นกลุ่มนี้อาจใช้เวลานานกว่าตลาดจะรับรู้ ต้องอดทน "
+                f"· รอบนี้ผ่านเกณฑ์ {len(top)} ตัว (ไม่เติมให้ครบ 20 ถ้าผ่านไม่ถึง)")
+            if len(top) == 0:
+                st.info("รอบนี้ไม่มีหุ้นผ่านเกณฑ์ทั้งหมด — ลองเลือกกลุ่มหุ้นแบบรวม S&P 400 ที่แถบซ้าย")
         summary_table(top, col, key_h)
         q = st.text_input("ค้นหาในรายการนี้", key=f"q_{key_h}", placeholder="เช่น AAPL, Microsoft, เทคโนโลยี")
         st.caption("กดที่ชื่อหุ้นเพื่อดูรายละเอียด ธุรกิจ กราฟ งบการเงิน และข่าว")

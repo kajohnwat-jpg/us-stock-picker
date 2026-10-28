@@ -128,7 +128,7 @@ def _collect_meta(tables: list[pd.DataFrame]) -> None:
                 m.setdefault("industry", row[ind])
 
 
-def get_universe(quick: bool = False) -> tuple[list[str], str]:
+def get_universe(quick: bool = False, include_mid: bool = False) -> tuple[list[str], str]:
     """คืนรายชื่อหุ้น S&P 500 + Nasdaq-100 (ดึงสดจาก Wikipedia)"""
     if quick:
         return sorted(set(FALLBACK_TICKERS)), "Quick mode (~200 บริษัทขนาดใหญ่)"
@@ -152,6 +152,16 @@ def get_universe(quick: bool = False) -> tuple[list[str], str]:
             src.append(f"Nasdaq-100 ({len(nd)})")
     except Exception as e:
         print(f"  ! ดึงรายชื่อ Nasdaq-100 ไม่ได้: {e}")
+    if include_mid:
+        try:
+            tabs = _read_wiki_tables("https://en.wikipedia.org/wiki/List_of_S%26P_400_companies")
+            md_ = _symbols_from_tables(tabs, 350)
+            _collect_meta(tabs)
+            if md_:
+                tickers.update(md_)
+                src.append(f"S&P MidCap 400 ({len(md_)})")
+        except Exception as e:
+            print(f"  ! ดึงรายชื่อ S&P 400 ไม่ได้: {e}")
     if len(tickers) < 300:
         tickers.update(FALLBACK_TICKERS)
         src.append("รายชื่อสำรอง")
@@ -647,23 +657,37 @@ def build_scores(df: pd.DataFrame) -> pd.DataFrame:
                      weights=[45, 30, 25])
     d["s_mom"] = pct(d["mom_12_1"])
     ind = (d["industry"].fillna("") if "industry" in d else pd.Series("", index=d.index)).str.lower()
-    d["is_cyclical"] = ind.str.contains("|".join(CYCLICAL_KEYWORDS), regex=True)
+    d["is_cyclical"] = ind.str.contains("|".join(CYCLICAL_KEYWORDS), regex=True) | d.index.isin(MEMORY_TICKERS)
     d["score_buy"] = (d["s_quality"] * 0.25 + d["s_fwd"] * 0.20 + d["s_mom"] * 0.20 + d["s_value"] * 0.15
                       + d["s_analyst"] * 0.10 + d["s_safety"] * 0.10)
     d["score_buy"] = (d["score_buy"] - np.where(num("profitMargins") <= 0, 15, 0)
                       - np.where(d["price"] < d["sma200"], 5, 0)
                       - np.where(d["is_cyclical"], 5, 0)
                       - np.where(de > 300, 5, 0))
+
+    # ---------- 💎 หุ้นดีที่ตลาดยังไม่รับรู้ ----------
+    d["s_unloved"] = avg(pct(d["mom_12_1"], higher_better=False), pct(d["from_hi52"], higher_better=False),
+                         pct(d["rs_1y"], higher_better=False), weights=[40, 35, 25])
+    d["s_coverage"] = pct(num("numberOfAnalystOpinions"), higher_better=False)
+    d["score_gem"] = (d["s_quality"] * 0.30 + d["s_value"] * 0.25 + d["s_fwd"] * 0.20
+                      + d["s_unloved"] * 0.15 + d["s_coverage"] * 0.10)
+    has_fund = d["has_fund"] if "has_fund" in d else pd.Series(True, index=d.index)
+    rg, eg = num("revenueGrowth"), num("earningsGrowth")
+    d["gem_ok"] = (has_fund & (num("profitMargins") > 0) & (num("freeCashflow") > 0) & (d["s_quality"] >= 55)
+                   & ((fwd_eps > 0) | (rg > 0)) & ~((rg < 0) & (eg < 0))
+                   & (de.isna() | (de <= 200)) & (d["ret_3m"] > -0.25) & ~d["is_cyclical"]
+                   & ((d["from_hi52"] <= -0.10) | (d["rs_1y"] < 0)))
     return d
 
 
 # อุตสาหกรรมที่กำไรขึ้นกับราคาสินค้าโภคภัณฑ์ (ดูดีที่สุดในสูตรตอนกำไรพีค)
+MEMORY_TICKERS = {"MU", "SNDK", "WDC", "STX"}  # หน่วยความจำ/สตอเรจ: ราคาขึ้นลงแบบสินค้าโภคภัณฑ์
 CYCLICAL_KEYWORDS = ["oil & gas", "gold", "silver", "copper", "steel", "metals & mining", "aluminum",
                      "agricultural", "fertilizer", "coal", "uranium"]
 
 
 def pick_top(d: pd.DataFrame, col: str, n: int, max_per_sector: int,
-             max_per_industry: int | None = None) -> pd.DataFrame:
+             max_per_industry: int | None = None, fill: bool = True) -> pd.DataFrame:
     ranked = d.sort_values(col, ascending=False)
     chosen, count, icount = [], {}, {}
     for idx, row in ranked.iterrows():
@@ -678,7 +702,7 @@ def pick_top(d: pd.DataFrame, col: str, n: int, max_per_sector: int,
         icount[ind] = icount.get(ind, 0) + 1
         if len(chosen) >= n:
             break
-    if max_per_industry and len(chosen) < n:  # ข้อมูลอุตสาหกรรมไม่พอ: เติมโดยไม่จำกัดอุตสาหกรรม
+    if fill and max_per_industry and len(chosen) < n:  # ข้อมูลอุตสาหกรรมไม่พอ: เติมโดยไม่จำกัดอุตสาหกรรม
         extra = [i for i in ranked.index if i not in chosen][: n - len(chosen)]
         chosen += extra
         return ranked.loc[chosen].sort_values(col, ascending=False)
@@ -769,7 +793,17 @@ def reasons(r: pd.Series, horizon: str) -> tuple[list[str], list[str]]:
     if fe is not None and not pd.isna(fe) and fe > 0.12:
         g.append(f"นักวิเคราะห์คาดกำไรต่อหุ้นปีหน้าโต {fmt_pct(fe, 0)}")
     if bool(sv(r.get("is_cyclical"), False)):
-        b.append("ธุรกิจวัฏจักร: กำไรขึ้นกับราคาสินค้าโภคภัณฑ์ อาจดูดีที่สุดตอนกำไรพีค")
+        b.append("ธุรกิจวัฏจักร: กำไรขึ้นกับราคาสินค้า (เช่น น้ำมัน โลหะ ชิปหน่วยความจำ) "
+                 "ตัวเลขมักดูดีที่สุดตอนกำไรพีค แล้วพลิกลงแรงเมื่อวัฏจักรกลับ")
+    if horizon == "gem":
+        if not pd.isna(r.get("from_hi52")) and r["from_hi52"] < -0.10:
+            g.append(f"ราคายังต่ำกว่าจุดสูงสุด 52 สัปดาห์ {fmt_pct(-r['from_hi52'], 0, False)} ทั้งที่พื้นฐานดี")
+        if not pd.isna(r.get("rs_1y")) and r["rs_1y"] < 0:
+            g.append(f"ผลตอบแทน 1 ปีแพ้ S&P 500 ({fmt_pct(r['rs_1y'], 0)}) — ตลาดยังไม่ให้ราคา")
+        na = sv(r.get("numberOfAnalystOpinions"), None)
+        if na is not None and na < 15:
+            g.append(f"นักวิเคราะห์ติดตามแค่ {int(na)} ราย (คนสนใจน้อย)")
+        b.append("หุ้นที่ตลาดมองข้ามบางตัวมีเหตุผลที่ตลาดกังวล (value trap) — ควรอ่านข่าวว่าทำไมราคาไม่ขึ้นก่อนซื้อ")
     eg = r.get("earningsGrowth")
     if eg is not None and not pd.isna(eg) and eg > 0.15:
         g.append(f"กำไรโต {fmt_pct(eg, 0)} YoY")
@@ -1047,6 +1081,11 @@ HORIZONS = [
      "ความคุ้มค่าเทียบกลุ่มเดียวกัน 15% · มุมมองนักวิเคราะห์ 10% · ความมั่นคง 10% · "
      "หักคะแนน: ขาดทุน, ราคาต่ำกว่า SMA200, หุ้นวัฏจักรสินค้าโภคภัณฑ์ (น้ำมัน/โลหะ/ปุ๋ย), หนี้สูงมาก · "
      "จำกัดอุตสาหกรรมเดียวกันไม่เกิน 2 ตัว"),
+    ("gem", "score_gem", "💎 หุ้นดีที่ตลาดยังไม่รับรู้",
+     "หาบริษัทที่ **พื้นฐานดีแต่ราคายังไม่วิ่ง**: คุณภาพกิจการ 30% · ราคาถูกเทียบกลุ่มเดียวกัน 25% · "
+     "กำไร/รายได้กำลังโต 20% · ราคายังแพ้ตลาดหรือห่างจุดสูงสุด 15% · นักวิเคราะห์ติดตามน้อย 10% · "
+     "คัดเฉพาะ: มีกำไร, กระแสเงินสดเป็นบวก, คุณภาพผ่านเกณฑ์, ธุรกิจยังโต, หนี้ไม่สูง, ไม่ได้ร่วงแรงใน 3 เดือน, "
+     "ไม่ใช่หุ้นวัฏจักร · จำกัดอุตสาหกรรมเดียวกันไม่เกิน 2 ตัว"),
     ("week", "score_week", "รายสัปดาห์",
      "เน้นสัญญาณ Technical ระยะสั้น (MACD, RSI, ADX, วอลุ่ม, โมเมนตัม 1 สัปดาห์–1 เดือน) 45% · แนวโน้มหลัก 15% · "
      "ข่าวล่าสุด 20% · คุณภาพกิจการ 10% · ความมั่นคง 10% · หักคะแนนถ้าประกาศงบภายใน 7 วัน"),
@@ -1111,13 +1150,13 @@ class ScanError(RuntimeError):
 
 def run_scan(quick: bool = False, top: int = 20, min_cap: float = 10e9, min_dollar_vol: float = 30e6,
              max_per_sector: int = 4, workers: int = 8, translate: bool = True,
-             log=print, progress=None) -> dict:
+             log=print, progress=None, include_mid: bool = False) -> dict:
     """สแกนหุ้นทั้งหมดแล้วคืนผล {scored, picks, meta, desc_th}  (ใช้ร่วมกันทั้ง CLI และเว็บแอป)"""
     step = progress or (lambda frac, msg: None)
     t0 = time.time()
     step(0.02, "โหลดรายชื่อหุ้น S&P 500 + Nasdaq-100 ...")
     log("[1/6] โหลดรายชื่อหุ้น S&P 500 + Nasdaq-100 ...")
-    universe, src = get_universe(quick)
+    universe, src = get_universe(quick, include_mid and not quick)
     log(f"  ได้ {len(universe)} ตัว ({src})")
 
     step(0.08, f"ดาวน์โหลดราคาย้อนหลัง 5 ปีของ {len(universe)} ตัว ...")
@@ -1197,6 +1236,9 @@ def run_scan(quick: bool = False, top: int = 20, min_cap: float = 10e9, min_doll
     with_fund = scored[scored["has_fund"]]
     picks = {}
     for key, col, *_ in HORIZONS:
+        if key == "gem":  # คัดเฉพาะตัวที่ผ่านเกณฑ์จริง (ไม่เติมตัวอื่นให้ครบ)
+            picks[key] = pick_top(scored[scored["gem_ok"]], col, top, max_per_sector, 2, fill=False)
+            continue
         base = with_fund if (key != "week" and len(with_fund) >= top * 3) else scored
         picks[key] = pick_top(base, col, top, max_per_sector, 2 if key == "buy" else None)
 
