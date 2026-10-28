@@ -4,7 +4,10 @@ US Stock Picker — เว็บแอป (Streamlit)
 รัน:  streamlit run app.py        หรือ deploy ฟรีบน Streamlit Community Cloud
 """
 import datetime as dt
+import hashlib
+import pickle
 import threading
+from pathlib import Path
 import time
 
 import numpy as np
@@ -32,14 +35,44 @@ def md(x) -> str:
     return str(x).replace("$", "\\$")
 
 
+SAVE_DIR = Path(__file__).resolve().parent / "cache"
+
+
+def _save_path(key: tuple) -> Path:
+    return SAVE_DIR / f"scan_{hashlib.md5(repr(key).encode()).hexdigest()[:10]}.pkl"
+
+
+def _load_saved(key: tuple):
+    """โหลดผลสแกนล่าสุดที่บันทึกไว้ (ใช้ได้แม้แอปรีสตาร์ท หรือ Yahoo บล็อกตอนสแกนใหม่)"""
+    try:
+        with open(_save_path(key), "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
 def _scan_job(key: tuple, job: dict):
     """รันสแกนใน background thread — ไม่หยุดแม้ผู้ใช้กดปุ่ม/เปลี่ยนหน้า"""
     quick, min_cap, max_sector, translate = key
     try:
-        res = sp.run_scan(quick=quick, top=20, min_cap=min_cap, max_per_sector=max_sector, workers=3,
+        res = sp.run_scan(quick=quick, top=20, min_cap=min_cap, max_per_sector=max_sector, workers=2,
                           translate=translate, progress=lambda f, m: job.update(frac=f, msg=m))
-        res["ts"] = time.time()
+        res["ts"] = res["ts_data"] = time.time()
+        old = store()["results"].get(key) or _load_saved(key)
+        # ถ้ารอบใหม่ได้งบการเงินน้อยกว่ารอบเก่ามาก (Yahoo บล็อก) ให้คงผลเดิมไว้ แต่ใช้ราคา/ทดสอบย้อนหลังใหม่ไม่ได้
+        if old and old["meta"].get("n_fund", 0) > 0 and res["meta"].get("n_fund", 0) < 0.3 * old["meta"]["n_fund"] \
+                and time.time() - old["ts"] < 3 * 86400:
+            job["error"] = "Yahoo จำกัดการดึงงบการเงิน — แสดงผลรอบก่อนหน้าที่ข้อมูลครบกว่าแทน"
+            old["ts"] = time.time()  # ลองใหม่อีกครั้งในรอบถัดไป (ไม่ถล่ม Yahoo ทุกนาที)
+            store()["results"][key] = old
+            return
         store()["results"][key] = res
+        try:
+            SAVE_DIR.mkdir(exist_ok=True)
+            with open(_save_path(key), "wb") as f:
+                pickle.dump(res, f)
+        except Exception:
+            pass
     except Exception as e:  # noqa: BLE001
         job["error"] = str(e)
     finally:
@@ -61,6 +94,10 @@ def start_job(key: tuple):
 def get_results(key: tuple, force: bool):
     s = store()
     cached = s["results"].get(key)
+    if cached is None:
+        cached = _load_saved(key)
+        if cached is not None:
+            s["results"][key] = cached
     stale = (not cached) or (time.time() - cached["ts"] > CACHE_HOURS * 3600)
     if force and cached and time.time() - cached["ts"] < 120:
         force = False  # เพิ่งสแกนไปไม่ถึง 2 นาที
@@ -111,12 +148,17 @@ scored, picks, meta, desc_th = res["scored"], res["picks"], res["meta"], res["de
 # Header
 # ---------------------------------------------------------------------------
 st.title("📈 US Stock Picker — Top 20 หุ้น USA")
-age_min = int((time.time() - res["ts"]) / 60)
+age_min = int((time.time() - res.get("ts_data", res["ts"])) / 60)
 st.caption(f"อัปเดตล่าสุด {meta['date']} น. (เวลาไทย, {age_min} นาทีที่แล้ว) · แหล่งข้อมูล Yahoo Finance · "
            f"สแกน {meta['n_scanned']} ตัว ผ่านเกณฑ์ความน่าเชื่อถือ {meta['n_pass']} ตัว "
            f"(มูลค่าตลาด ≥ {sp.fmt_cap(meta['min_cap'])}) · {md(meta['universe_src'])}")
 n_fund = meta.get("n_fund", meta["n_pass"])
-if n_fund < 0.8 * meta["n_pass"]:
+if n_fund == 0:
+    st.error("รอบนี้ Yahoo Finance ไม่ให้ข้อมูลงบการเงินเลย (จำกัดการเรียกจากเซิร์ฟเวอร์ชั่วคราว) — "
+             "ลิสต์ทุกช่วงเวลาตอนนี้คัดจาก **ราคา/Technical อย่างเดียว** ซึ่งผลทดสอบย้อนหลังชี้ว่ายังไม่ได้ผล "
+             "**อย่าใช้ลิสต์รอบนี้ตัดสินใจซื้อ** · แท็บทดสอบย้อนหลังยังใช้ได้ตามปกติ · "
+             f"ระบบจะลองดึงงบใหม่อัตโนมัติทุก {CACHE_HOURS} ชั่วโมง (งบที่ได้แล้วเก็บไว้ 7 วัน)")
+elif n_fund < 0.8 * meta["n_pass"]:
     st.warning(f"รอบนี้ดึงงบการเงินได้ {n_fund} จาก {meta['n_pass']} ตัว (Yahoo จำกัดการเรียกข้อมูลชั่วคราว) — "
                "ลิสต์รายเดือน/รายปีเลือกเฉพาะหุ้นที่มีงบครบ ส่วนตัวที่ขาดข้อมูลจะได้คะแนนพื้นฐานกลาง ๆ "
                f"ระบบจะลองดึงส่วนที่ขาดใหม่ในรอบถัดไป (ทุก {CACHE_HOURS} ชั่วโมง)")

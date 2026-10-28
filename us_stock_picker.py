@@ -99,6 +99,35 @@ def _symbols_from_tables(tables: list[pd.DataFrame], min_rows: int) -> list[str]
     return []
 
 
+WIKI_META: dict[str, dict] = {}  # ชื่อบริษัท/กลุ่มธุรกิจจาก Wikipedia (ใช้เมื่อ Yahoo ไม่ให้ข้อมูล)
+GICS_TO_YAHOO = {
+    "Information Technology": "Technology", "Health Care": "Healthcare", "Financials": "Financial Services",
+    "Consumer Discretionary": "Consumer Cyclical", "Consumer Staples": "Consumer Defensive",
+    "Materials": "Basic Materials", "Communication Services": "Communication Services",
+    "Industrials": "Industrials", "Energy": "Energy", "Utilities": "Utilities", "Real Estate": "Real Estate",
+}
+
+
+def _collect_meta(tables: list[pd.DataFrame]) -> None:
+    for t in tables:
+        cols = {str(c).lower(): c for c in t.columns}
+        sym = next((cols[k] for k in cols if "symbol" in k or "ticker" in k), None)
+        name = next((cols[k] for k in cols if k in ("security", "company", "company name")), None)
+        sec = next((cols[k] for k in cols if "gics sector" in k), None)
+        ind = next((cols[k] for k in cols if "sub-industry" in k or "sub industry" in k), None)
+        if sym is None or (name is None and sec is None):
+            continue
+        for _, row in t.iterrows():
+            tk = str(row[sym]).strip().replace(".", "-").upper()
+            m = WIKI_META.setdefault(tk, {})
+            if name is not None and isinstance(row[name], str):
+                m.setdefault("longName", row[name])
+            if sec is not None and isinstance(row[sec], str):
+                m.setdefault("sector", GICS_TO_YAHOO.get(row[sec], row[sec]))
+            if ind is not None and isinstance(row[ind], str):
+                m.setdefault("industry", row[ind])
+
+
 def get_universe(quick: bool = False) -> tuple[list[str], str]:
     """คืนรายชื่อหุ้น S&P 500 + Nasdaq-100 (ดึงสดจาก Wikipedia)"""
     if quick:
@@ -106,17 +135,21 @@ def get_universe(quick: bool = False) -> tuple[list[str], str]:
     tickers: set[str] = set()
     src = []
     try:
-        sp = _symbols_from_tables(_read_wiki_tables(
-            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"), 400)
-        tickers.update(sp)
-        src.append(f"S&P 500 ({len(sp)})")
+        tabs = _read_wiki_tables("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        sp = _symbols_from_tables(tabs, 400)
+        _collect_meta(tabs)
+        if sp:
+            tickers.update(sp)
+            src.append(f"S&P 500 ({len(sp)})")
     except Exception as e:
         print(f"  ! ดึงรายชื่อ S&P 500 ไม่ได้: {e}")
     try:
-        nd = _symbols_from_tables(_read_wiki_tables(
-            "https://en.wikipedia.org/wiki/Nasdaq-100"), 90)
-        tickers.update(nd)
-        src.append(f"Nasdaq-100 ({len(nd)})")
+        tabs = _read_wiki_tables("https://en.wikipedia.org/wiki/Nasdaq-100")
+        nd = _symbols_from_tables(tabs, 90)
+        _collect_meta(tabs)
+        if nd:
+            tickers.update(nd)
+            src.append(f"Nasdaq-100 ({len(nd)})")
     except Exception as e:
         print(f"  ! ดึงรายชื่อ Nasdaq-100 ไม่ได้: {e}")
     if len(tickers) < 300:
@@ -325,7 +358,8 @@ def _fetch_info(t: str) -> dict:
 
 def fetch_fundamentals(tickers: list[str], workers: int = 4, progress=None) -> dict[str, dict]:
     CACHE_DIR.mkdir(exist_ok=True)
-    cache_file = CACHE_DIR / f"info_{dt.date.today():%Y%m%d}.json"
+    cache_file = CACHE_DIR / "info_cache.json"
+    max_age = 7 * 86400  # งบการเงินเปลี่ยนทุกไตรมาส: เก็บไว้ 7 วัน ลดการเรียก Yahoo
     cache: dict[str, dict] = {}
     if cache_file.exists():
         try:
@@ -333,7 +367,9 @@ def fetch_fundamentals(tickers: list[str], workers: int = 4, progress=None) -> d
         except Exception:
             cache = {}
     # ดึงใหม่ทั้งตัวที่ยังไม่มี และตัวที่ได้ข้อมูลไม่ครบรอบก่อน
-    todo = [t for t in tickers if not cache.get(t) or cache[t].get("_partial")]
+    now_ts = time.time()
+    todo = [t for t in tickers if not cache.get(t) or cache[t].get("_partial")
+            or now_ts - cache[t].get("_ts", 0) > max_age]
     _RATE.update(pause_until=0.0, fails=0, blocked=False, deadline=time.time() + INFO_TIME_BUDGET)
     if todo:
         print(f"  ดึงงบการเงิน/ข้อมูลบริษัท {len(todo)} ตัว (cache แล้ว {len(tickers) - len(todo)}) ...")
@@ -343,15 +379,19 @@ def fetch_fundamentals(tickers: list[str], workers: int = 4, progress=None) -> d
             for f in as_completed(futs):
                 t = futs[f]
                 res = f.result()
-                if res or not cache.get(t):
+                if res:
+                    res["_ts"] = time.time()
+                if res and (not res.get("_partial") or not cache.get(t) or cache[t].get("_partial")):
                     cache[t] = res
+                elif not cache.get(t):
+                    cache[t] = {}
                 done += 1
                 if progress and (done % 10 == 0 or done == len(todo)):
                     progress(done, len(todo))
                 if done % 50 == 0 or done == len(todo):
                     print(f"    {done}/{len(todo)}")
                     cache_file.write_text(json.dumps(cache), encoding="utf-8")
-    for old in CACHE_DIR.glob("info_*.json"):
+    for old in CACHE_DIR.glob("info_2*.json"):  # ไฟล์ cache รูปแบบเก่า
         if old != cache_file:
             try:
                 old.unlink()
@@ -1068,13 +1108,15 @@ def run_scan(quick: bool = False, top: int = 20, min_cap: float = 10e9, min_doll
         if k not in fdf:
             fdf[k] = np.nan
     d = d.join(fdf)
-    d["has_fund"] = d["sector"].notna() | d["longName"].notna()
+    d["has_fund"] = (d[["returnOnEquity", "operatingMargins", "forwardPE", "revenueGrowth"]]
+                     .apply(pd.to_numeric, errors="coerce").notna().any(axis=1))
+    # เติมชื่อบริษัท/กลุ่มธุรกิจจาก Wikipedia ให้ตัวที่ Yahoo ไม่ให้ข้อมูล
+    for k in ("longName", "sector", "industry"):
+        wiki = pd.Series({t: WIKI_META.get(t, {}).get(k) for t in d.index}, dtype=object)
+        d[k] = d[k].where(d[k].notna(), wiki)
     mc = pd.to_numeric(d["marketCap"], errors="coerce")
     n_fund, n_liq = int(d["has_fund"].sum()), len(d)
     log(f"  ได้งบการเงินครบ {n_fund}/{n_liq} ตัว · มีมูลค่าตลาด {int(mc.notna().sum())} ตัว")
-    if n_fund == 0 and mc.notna().sum() == 0:
-        raise ScanError("Yahoo Finance ปฏิเสธการดึงข้อมูลบริษัททั้งหมด (จำกัดการเรียกชั่วคราว) — "
-                        "รอประมาณ 15–30 นาทีแล้วกด 'ลองใหม่'")
     if mc.notna().mean() < 0.5:
         # ข้อมูลมูลค่าตลาดขาดเยอะ: ใช้มูลค่าซื้อขายต่อวันสูง (หุ้นใหญ่) เป็นเกณฑ์แทนสำหรับตัวที่ขาดข้อมูล
         keep = (mc >= min_cap) | (mc.isna() & (d["dollar_vol"] >= 150e6))
