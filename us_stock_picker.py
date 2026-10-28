@@ -639,20 +639,49 @@ def build_scores(df: pd.DataFrame) -> pd.DataFrame:
     d["score_year"] = d["score_year"] - np.where(num("profitMargins") <= 0, 15, 0) \
         - np.where(de > 300, 5, 0)
     d["score_month"] = d["score_month"] - np.where(num("profitMargins") <= 0, 8, 0)
+
+    # ---------- ⭐ อันดับน่าซื้อสะสมตอนนี้ (มองไปข้างหน้า) ----------
+    fwd_eps = (num("forwardEps") / num("trailingEps") - 1).where(num("trailingEps") > 0).clip(-1, 2)
+    d["fwd_eps_growth"] = fwd_eps
+    d["s_fwd"] = avg(pct(fwd_eps), pct(num("revenueGrowth").clip(-1, 2)), pct(num("earningsGrowth").clip(-1, 3)),
+                     weights=[45, 30, 25])
+    d["s_mom"] = pct(d["mom_12_1"])
+    ind = (d["industry"].fillna("") if "industry" in d else pd.Series("", index=d.index)).str.lower()
+    d["is_cyclical"] = ind.str.contains("|".join(CYCLICAL_KEYWORDS), regex=True)
+    d["score_buy"] = (d["s_quality"] * 0.25 + d["s_fwd"] * 0.20 + d["s_mom"] * 0.20 + d["s_value"] * 0.15
+                      + d["s_analyst"] * 0.10 + d["s_safety"] * 0.10)
+    d["score_buy"] = (d["score_buy"] - np.where(num("profitMargins") <= 0, 15, 0)
+                      - np.where(d["price"] < d["sma200"], 5, 0)
+                      - np.where(d["is_cyclical"], 5, 0)
+                      - np.where(de > 300, 5, 0))
     return d
 
 
-def pick_top(d: pd.DataFrame, col: str, n: int, max_per_sector: int) -> pd.DataFrame:
+# อุตสาหกรรมที่กำไรขึ้นกับราคาสินค้าโภคภัณฑ์ (ดูดีที่สุดในสูตรตอนกำไรพีค)
+CYCLICAL_KEYWORDS = ["oil & gas", "gold", "silver", "copper", "steel", "metals & mining", "aluminum",
+                     "agricultural", "fertilizer", "coal", "uranium"]
+
+
+def pick_top(d: pd.DataFrame, col: str, n: int, max_per_sector: int,
+             max_per_industry: int | None = None) -> pd.DataFrame:
     ranked = d.sort_values(col, ascending=False)
-    chosen, count = [], {}
+    chosen, count, icount = [], {}, {}
     for idx, row in ranked.iterrows():
         sec = sv(row.get("sector"), None) or f"_{idx}"  # ไม่รู้กลุ่ม = ไม่นับรวมกับตัวอื่น
+        ind = sv(row.get("industry"), None) or f"_{idx}"
         if count.get(sec, 0) >= max_per_sector:
+            continue
+        if max_per_industry and icount.get(ind, 0) >= max_per_industry:
             continue
         chosen.append(idx)
         count[sec] = count.get(sec, 0) + 1
+        icount[ind] = icount.get(ind, 0) + 1
         if len(chosen) >= n:
             break
+    if max_per_industry and len(chosen) < n:  # ข้อมูลอุตสาหกรรมไม่พอ: เติมโดยไม่จำกัดอุตสาหกรรม
+        extra = [i for i in ranked.index if i not in chosen][: n - len(chosen)]
+        chosen += extra
+        return ranked.loc[chosen].sort_values(col, ascending=False)
     return ranked.loc[chosen]
 
 
@@ -736,6 +765,11 @@ def reasons(r: pd.Series, horizon: str) -> tuple[list[str], list[str]]:
             g.append(f"รายได้โต {fmt_pct(rg, 0)} YoY")
         elif rg < 0:
             b.append(f"รายได้หดตัว {fmt_pct(rg, 0)} YoY")
+    fe = r.get("fwd_eps_growth")
+    if fe is not None and not pd.isna(fe) and fe > 0.12:
+        g.append(f"นักวิเคราะห์คาดกำไรต่อหุ้นปีหน้าโต {fmt_pct(fe, 0)}")
+    if bool(sv(r.get("is_cyclical"), False)):
+        b.append("ธุรกิจวัฏจักร: กำไรขึ้นกับราคาสินค้าโภคภัณฑ์ อาจดูดีที่สุดตอนกำไรพีค")
     eg = r.get("earningsGrowth")
     if eg is not None and not pd.isna(eg) and eg > 0.15:
         g.append(f"กำไรโต {fmt_pct(eg, 0)} YoY")
@@ -1007,6 +1041,12 @@ document.querySelectorAll('input.q').forEach(i=>i.oninput=()=>{const q=i.value.t
 """
 
 HORIZONS = [
+    ("buy", "score_buy", "⭐ น่าซื้อสะสมตอนนี้",
+     "จัดอันดับหุ้นสำหรับ **ซื้อเก็บระยะยาว** จากข้อมูลปัจจุบัน + แนวโน้มข้างหน้า: คุณภาพกิจการ 25% · "
+     "การเติบโตที่คาดการณ์ (กำไรต่อหุ้นปีหน้า, รายได้, กำไร) 20% · โมเมนตัมราคา 12 เดือน 20% · "
+     "ความคุ้มค่าเทียบกลุ่มเดียวกัน 15% · มุมมองนักวิเคราะห์ 10% · ความมั่นคง 10% · "
+     "หักคะแนน: ขาดทุน, ราคาต่ำกว่า SMA200, หุ้นวัฏจักรสินค้าโภคภัณฑ์ (น้ำมัน/โลหะ/ปุ๋ย), หนี้สูงมาก · "
+     "จำกัดอุตสาหกรรมเดียวกันไม่เกิน 2 ตัว"),
     ("week", "score_week", "รายสัปดาห์",
      "เน้นสัญญาณ Technical ระยะสั้น (MACD, RSI, ADX, วอลุ่ม, โมเมนตัม 1 สัปดาห์–1 เดือน) 45% · แนวโน้มหลัก 15% · "
      "ข่าวล่าสุด 20% · คุณภาพกิจการ 10% · ความมั่นคง 10% · หักคะแนนถ้าประกาศงบภายใน 7 วัน"),
@@ -1158,7 +1198,7 @@ def run_scan(quick: bool = False, top: int = 20, min_cap: float = 10e9, min_doll
     picks = {}
     for key, col, *_ in HORIZONS:
         base = with_fund if (key != "week" and len(with_fund) >= top * 3) else scored
-        picks[key] = pick_top(base, col, top, max_per_sector)
+        picks[key] = pick_top(base, col, top, max_per_sector, 2 if key == "buy" else None)
 
     desc_th = {}
     if translate:

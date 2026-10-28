@@ -299,7 +299,7 @@ def show_stock(r: pd.Series, horizon: str, rank: int, col: str):
             st.caption("ไม่พบข่าวล่าสุด")
 
 
-def summary_table(top: pd.DataFrame, col: str):
+def summary_table(top: pd.DataFrame, col: str, key_h: str = ""):
     rows = []
     for n, (t, r) in enumerate(top.iterrows(), 1):
         rows.append({
@@ -307,8 +307,11 @@ def summary_table(top: pd.DataFrame, col: str):
             "บริษัท": sp.sv(r.get("longName")) or sp.sv(r.get("shortName")) or t,
             "กลุ่ม": sp.SECTOR_TH.get(sp.sv(r.get("sector"), "-"), sp.sv(r.get("sector"), "-")),
             "ราคา ($)": r["price"], "วันนี้": r["chg_1d"] * 100, "1 ปี": r["ret_1y"] * 100,
-            "คะแนน": r[col], "Technical": r["s_tech_short"], "คุณภาพ": r["s_quality"],
-            "เติบโต": r["s_growth"], "ข่าว": r["s_news"],
+            "คะแนน": r[col],
+            **({"คุณภาพ": r["s_quality"], "เติบโตข้างหน้า": r["s_fwd"], "โมเมนตัม": r["s_mom"],
+                "ความคุ้มค่า": r["s_value"]} if key_h == "buy" else
+               {"Technical": r["s_tech_short"], "คุณภาพ": r["s_quality"], "เติบโต": r["s_growth"],
+                "ข่าว": r["s_news"]}),
         })
     df = pd.DataFrame(rows)
     pc = lambda lbl: st.column_config.ProgressColumn(lbl, min_value=0, max_value=100, format="%.0f")
@@ -317,19 +320,27 @@ def summary_table(top: pd.DataFrame, col: str):
         "วันนี้": st.column_config.NumberColumn("วันนี้ %", format="%+.2f"),
         "1 ปี": st.column_config.NumberColumn("1 ปี %", format="%+.1f"),
         "คะแนน": pc("คะแนนรวม"), "Technical": pc("Technical"), "คุณภาพ": pc("คุณภาพ"),
-        "เติบโต": pc("เติบโต"), "ข่าว": pc("ข่าว"),
+        "เติบโต": pc("เติบโต"), "ข่าว": pc("ข่าว"), "เติบโตข้างหน้า": pc("เติบโตข้างหน้า"),
+        "โมเมนตัม": pc("โมเมนตัม"), "ความคุ้มค่า": pc("ความคุ้มค่า"),
     })
 
 
-tab_labels = [f"📅 {label}" for _, _, label, _ in sp.HORIZONS] + ["🔎 หุ้นทั้งหมด", "🧪 ทดสอบย้อนหลัง"]
+tab_labels = [label if label.startswith("⭐") else f"📅 {label}" for _, _, label, _ in sp.HORIZONS] + ["🔎 หุ้นทั้งหมด", "🧪 ทดสอบย้อนหลัง"]
 tabs = st.tabs(tab_labels)
-for tab, (key_h, col, label, method) in zip(tabs[:3], sp.HORIZONS):
+NH = len(sp.HORIZONS)
+for tab, (key_h, col, label, method) in zip(tabs[:NH], sp.HORIZONS):
     with tab:
         st.info(f"**วิธีให้คะแนน{label}:** {md(method)}")
         top = picks[key_h]
         mix = top["sector"].fillna("Other").map(lambda s: sp.SECTOR_TH.get(s, s)).value_counts()
         st.caption("สัดส่วนกลุ่มธุรกิจ: " + " · ".join(f"{k} {v}" for k, v in mix.items()))
-        summary_table(top, col)
+        if key_h == "buy":
+            st.success(
+                "**วิธีใช้ลิสต์นี้:** อันดับบนคือหุ้นที่ข้อมูลตอนนี้ดีที่สุดตามสูตร ไม่ใช่การรับประกันว่าจะขึ้น · "
+                "เลือก 5–10 ตัวที่คุณ**เข้าใจธุรกิจ** (กดชื่อหุ้นเพื่ออ่าน) · ทยอยซื้อ (DCA) ไม่ซื้อทีเดียว · "
+                "แบ่งเงินเท่า ๆ กัน · ให้ส่วนนี้เป็นเงินส่วนเสริม ส่วนหลักยังเป็นกองทุนดัชนี S&P 500 · "
+                "ทบทวนทุก 3–6 เดือน ไม่ต้องเปลี่ยนตามอันดับทุกวัน")
+        summary_table(top, col, key_h)
         q = st.text_input("ค้นหาในรายการนี้", key=f"q_{key_h}", placeholder="เช่น AAPL, Microsoft, เทคโนโลยี")
         st.caption("กดที่ชื่อหุ้นเพื่อดูรายละเอียด ธุรกิจ กราฟ งบการเงิน และข่าว")
         for n, (t, r) in enumerate(top.iterrows(), 1):
@@ -339,7 +350,7 @@ for tab, (key_h, col, label, method) in zip(tabs[:3], sp.HORIZONS):
                 continue
             show_stock(r, key_h, n, col)
 
-with tabs[3]:
+with tabs[NH]:
     st.caption("คะแนนของหุ้นทุกตัวที่ผ่านเกณฑ์ — กดหัวคอลัมน์เพื่อเรียงลำดับ")
     allq = st.text_input("ค้นหาหุ้น", key="q_all", placeholder="เช่น NVDA หรือ Coca-Cola")
     cols = [c for c in sp.EXPORT_COLS if c in scored]
@@ -382,7 +393,7 @@ def get_backtest(key_s: str, top: int, cost: float):
     return cache[k]
 
 
-with tabs[4]:
+with tabs[NH + 1]:
     if "panels" not in res:
         st.warning("ข้อมูลรอบนี้ยังไม่มีราคาย้อนหลังสำหรับทดสอบ — กด 🔄 สแกนใหม่ตอนนี้ ที่แถบซ้าย")
     else:
@@ -401,7 +412,7 @@ with tabs[4]:
             st.error(f"ทดสอบไม่สำเร็จ: {e}")
             st.stop()
 
-        st.markdown("#### สรุปผลทั้ง 3 แบบ")
+        st.markdown(f"#### สรุปผลทั้ง {len(results)} แบบ")
         icon = {"good": "🟢 มีประสิทธิภาพ", "mixed": "🟡 ช่วยได้เล็กน้อย", "bad": "🔴 ยังไม่พบหลักฐาน"}
         rows = []
         for k_, r_ in results.items():
