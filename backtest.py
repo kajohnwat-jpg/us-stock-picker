@@ -25,6 +25,16 @@ STRATS = {
               "desc": "ปรับพอร์ตทุก 21 วันทำการ · คะแนน = Technical สั้น 50% + แนวโน้ม 50%"},
     "year": {"label": "ระยะยาว (แนวโน้ม)", "hold": 63, "w_short": 0.0, "w_trend": 1.0,
              "desc": "ปรับพอร์ตทุก 3 เดือน · คะแนน = แนวโน้มระยะยาว 100% (ส่วน Fundamental ทดสอบย้อนหลังไม่ได้)"},
+    # ---- สูตรทางเลือก (กำหนดไว้ล่วงหน้าจากงานวิจัย ไม่ได้ปรับให้เข้ากับผลทดสอบ) ----
+    "mom": {"label": "ทางเลือก A: โมเมนตัม 12 เดือน", "hold": 21, "kind": "mom", "buffer": True,
+            "desc": "เลือกหุ้นที่ราคาขึ้นมากสุดในรอบ 12 เดือน (ไม่นับเดือนล่าสุด) และราคาอยู่เหนือ SMA200 · "
+                    "ปรับพอร์ตทุกเดือน · ถือตัวเดิมต่อถ้ายังอยู่ใน Top 2 เท่า (ลดการซื้อขาย)"},
+    "mom_lv": {"label": "ทางเลือก B: โมเมนตัม + ผันผวนต่ำ", "hold": 21, "kind": "mom_lv", "buffer": True,
+               "desc": "คะแนน = โมเมนตัม 12 เดือน 60% + ความผันผวนต่ำ 40% · เฉพาะหุ้นที่อยู่เหนือ SMA200 · "
+                       "ปรับพอร์ตทุกเดือน · ถือตัวเดิมต่อถ้ายังอยู่ใน Top 2 เท่า"},
+    "big_mom": {"label": "ทางเลือก C: หุ้นใหญ่ 100 ตัว + โมเมนตัม", "hold": 21, "kind": "big_mom", "buffer": True,
+                "desc": "คัดเฉพาะ 100 ตัวที่ซื้อขายมูลค่าสูงสุด (หุ้นยักษ์) แล้วเลือกตามโมเมนตัม 12 เดือน · "
+                        "เฉพาะหุ้นที่อยู่เหนือ SMA200 · ปรับพอร์ตทุกเดือน · ถือตัวเดิมต่อถ้ายังอยู่ใน Top 2 เท่า"},
 }
 WARMUP = 273  # ต้องมีข้อมูล ~13 เดือนก่อนเริ่มคำนวณโมเมนตัม 12-1 และ SMA200
 
@@ -119,7 +129,9 @@ def compute_scores(P: dict, spy: pd.Series, dates: pd.DatetimeIndex, min_dollar_
                   + above50 * 10.0)
     trend = _wavg([trend_long, _pct(at(mom_12_1), elig), _pct(at(rs(126)), elig), _pct(at(rs(63)), elig),
                    _pct(at(from_hi), elig), _pct(at(dd), elig)], [30, 20, 15, 10, 15, 10])
-    return tech_short.where(elig), trend.where(elig), elig
+    extra = {"mom": at(mom_12_1).where(elig), "vol": at(ret.rolling(252).std()).where(elig),
+             "dv60": at((c * v).rolling(60).mean()).where(elig), "above200": above200}
+    return tech_short.where(elig), trend.where(elig), elig, extra
 
 
 # ---------------------------------------------------------------------------
@@ -152,32 +164,54 @@ def run_backtest(P: dict, spy: pd.Series, key: str, top: int = 20, cost_bps: flo
     if len(reb) < 4:
         raise ValueError("ข้อมูลย้อนหลังไม่พอสำหรับทดสอบ (ต้องมีอย่างน้อย ~1.5 ปี)")
     dates = close.index[reb]
-    short, trend, elig = compute_scores(P, spy, dates, min_dollar_vol)
-    score = short * s["w_short"] + trend * s["w_trend"]
+    short, trend, elig, ex = compute_scores(P, spy, dates, min_dollar_vol)
+    kind = s.get("kind", "orig")
+    up = elig & ex["above200"]
+    if kind == "mom":
+        score = ex["mom"].where(up)
+    elif kind == "mom_lv":
+        score = 0.6 * _pct(ex["mom"], up) + 0.4 * _pct(ex["vol"], up, higher=False)
+    elif kind == "big_mom":
+        big = ex["dv60"].rank(axis=1, ascending=False) <= 100
+        score = ex["mom"].where(up & big)
+    else:
+        score = short * s["w_short"] + trend * s["w_trend"]
 
     rows, prev = [], set()
     for k, i in enumerate(reb):
-        sc = score.iloc[k].dropna()
-        if len(sc) < top * 2:
+        if int(elig.iloc[k].sum()) < top * 2:
             continue
+        sc = score.iloc[k].dropna()
         entry, exit_ = i + 1, i + 1 + hold
         fwd = close.iloc[exit_] / close.iloc[entry] - 1
         fwd_el = fwd.reindex(sc.index)
-        picks = sc.nlargest(top).index
-        gross = fwd_el[picks].fillna(0).mean()
+        if s.get("buffer") and prev:
+            rk = sc.rank(ascending=False)
+            keep = [t for t in prev if t in rk.index and rk[t] <= top * 2]
+            fill = [t for t in sc.sort_values(ascending=False).index if t not in keep][: top - len(keep)]
+            picks = pd.Index(keep + fill)
+        else:
+            picks = sc.nlargest(top).index
+        # ถ้าหุ้นผ่านเกณฑ์น้อยกว่า top ส่วนที่เหลือถือเป็นเงินสด (ผลตอบแทน 0)
+        gross = fwd_el[picks].fillna(0).sum() / top
         turnover = len(set(picks) - prev) / top
         cost = turnover * (1 if not prev else 2) * cost_bps / 1e4
         valid = fwd_el.dropna()
-        q = pd.qcut(sc[valid.index].rank(method="first"), 5, labels=[1, 2, 3, 4, 5])
-        qmean = valid.groupby(q, observed=False).mean()
-        ic = sc[valid.index].rank().corr(valid.rank())
+        ew = fwd[elig.iloc[k]].dropna().mean()
+        if len(valid) >= 10:
+            q = pd.qcut(valid.index.map(sc).to_series(index=valid.index).rank(method="first"), 5,
+                        labels=[1, 2, 3, 4, 5])
+            qmean = valid.groupby(q, observed=False).mean()
+            ic = sc[valid.index].rank().corr(valid.rank())
+        else:
+            qmean, ic = pd.Series(dtype=float), np.nan
         rows.append({
             "เริ่ม": close.index[entry], "สิ้นสุด": close.index[exit_],
             "กลยุทธ์": gross - cost, "ก่อนหักค่าธรรมเนียม": gross,
-            "SPY": spy.iloc[exit_] / spy.iloc[entry] - 1, "ซื้อทุกตัวเท่ากัน": valid.mean(),
+            "SPY": spy.iloc[exit_] / spy.iloc[entry] - 1, "ซื้อทุกตัวเท่ากัน": ew,
             "turnover": turnover, "IC": ic, "จำนวนหุ้นที่ผ่านเกณฑ์": len(sc),
             **{f"Q{j}": qmean.get(j, np.nan) for j in range(1, 6)},
-            "หุ้นที่เลือก": ", ".join(picks),
+            "หุ้นที่เลือก": ", ".join(picks) if len(picks) else "(เงินสด)",
         })
         prev = set(picks)
 
@@ -224,7 +258,7 @@ def verdict(bt: dict) -> tuple[str, str]:
     if beat > 0.02 and t > 2 and st_["q_spread"] > 0:
         return "good", (f"สัญญาณมีประสิทธิภาพ: ชนะการซื้อทุกตัวเท่ากัน {beat * 100:+.1f}% ต่อปีหลังหักค่าธรรมเนียม "
                         f"และหุ้นคะแนนสูงทำผลงานดีกว่าหุ้นคะแนนต่ำ — {sig}")
-    if beat > 0 or (t > 2 and st_["q_spread"] > 0):
+    if (beat > 0 and t > 1) or (beat > -0.01 and t > 2 and st_["q_spread"] > 0):
         return "mixed", (f"ช่วยได้บ้างแต่ไม่ชัดเจน: เทียบการซื้อทุกตัวเท่ากัน {beat * 100:+.1f}% ต่อปีหลังหักค่าธรรมเนียม — {sig}")
     return "bad", (f"ยังไม่พบหลักฐานว่าสัญญาณนี้ช่วยเพิ่มผลตอบแทน: เทียบการซื้อทุกตัวเท่ากัน {beat * 100:+.1f}% ต่อปี — {sig} "
                    "จึงไม่ควรใช้สัญญาณช่วงเวลานี้เป็นเหตุผลหลักในการซื้อ")

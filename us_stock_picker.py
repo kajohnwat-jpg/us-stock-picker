@@ -70,6 +70,9 @@ SLB HAL OXY FANG NUE STLD FCX NEM DOW DD PPG ALB MLM VMC CARR OTIS JCI ETN ROK
 URI PWR GWW XYL DOV IR AME HUBB TDG HWM LHX TXT BA
 """.split()
 
+# หุ้นใน Nasdaq-100 ที่ไม่อยู่ใน S&P 500 (เติมให้เสมอ เผื่อดึงรายชื่อ Nasdaq-100 ไม่สำเร็จ)
+NASDAQ_EXTRA = "ASML AZN MELI PDD ARM SHOP CCEP TEAM DDOG ZS MDB GFS TRI".split()
+
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
 
@@ -84,10 +87,15 @@ def _read_wiki_tables(url: str) -> list[pd.DataFrame]:
 
 def _symbols_from_tables(tables: list[pd.DataFrame], min_rows: int) -> list[str]:
     for t in tables:
-        cols = [str(c) for c in t.columns]
-        for name in ("Symbol", "Ticker", "Ticker symbol"):
-            if name in cols and len(t) >= min_rows:
-                return [str(s).strip() for s in t[name].dropna().tolist()]
+        if len(t) < min_rows:
+            continue
+        for c in t.columns:
+            name = " ".join(map(str, c)) if isinstance(c, tuple) else str(c)
+            if "symbol" in name.lower() or "ticker" in name.lower():
+                vals = [str(s).strip() for s in t[c].dropna().tolist()]
+                vals = [v for v in vals if 0 < len(v) <= 6 and v.replace(".", "").replace("-", "").isalpha()]
+                if len(vals) >= min_rows * 0.9:
+                    return vals
     return []
 
 
@@ -114,6 +122,9 @@ def get_universe(quick: bool = False) -> tuple[list[str], str]:
     if len(tickers) < 300:
         tickers.update(FALLBACK_TICKERS)
         src.append("รายชื่อสำรอง")
+    if not any(x.startswith("Nasdaq") for x in src):
+        tickers.update(NASDAQ_EXTRA)
+        src.append("Nasdaq-100 ส่วนเพิ่ม")
     clean = sorted({t.replace(".", "-").upper() for t in tickers if t and t != "nan"})
     return clean, " + ".join(src)
 
@@ -260,18 +271,59 @@ INFO_KEYS = [
 ]
 
 
-def _fetch_info(t: str) -> dict:
-    for attempt in range(3):
-        try:
-            info = yf.Ticker(t).info or {}
-            if info:
-                return {k: info.get(k) for k in INFO_KEYS}
-        except Exception:
-            time.sleep(1.5 * (attempt + 1))
+_RATE = {"pause_until": 0.0, "fails": 0, "blocked": False, "deadline": float("inf")}
+INFO_TIME_BUDGET = 420  # วินาที: ถ้าดึงงบนานเกินนี้ ตัวที่เหลือใช้ข้อมูลแบบเบาไปก่อน
+
+
+def _is_rate_limit(e: Exception) -> bool:
+    m = f"{type(e).__name__} {e}".lower()
+    return "rate" in m or "too many" in m or "429" in m
+
+
+def _fast_info(t: str) -> dict:
+    """ข้อมูลพื้นฐานแบบเบา (มูลค่าตลาด) จาก fast_info — ใช้เมื่อ .info ถูกบล็อก"""
+    try:
+        fi = yf.Ticker(t).fast_info
+        mc = None
+        for k in ("market_cap", "marketCap"):
+            try:
+                mc = fi[k]
+                break
+            except Exception:
+                mc = getattr(fi, k, None)
+                if mc:
+                    break
+        if mc and not (isinstance(mc, float) and math.isnan(mc)):
+            return {"marketCap": float(mc), "quoteType": "EQUITY", "_partial": True}
+    except Exception:
+        pass
     return {}
 
 
-def fetch_fundamentals(tickers: list[str], workers: int = 8) -> dict[str, dict]:
+def _fetch_info(t: str) -> dict:
+    for attempt in range(3):
+        if _RATE["blocked"] or time.time() > _RATE["deadline"]:
+            break  # ถูกบล็อกต่อเนื่อง: ข้ามไปใช้ข้อมูลแบบเบาเลย ไม่เสียเวลารอ
+        wait = _RATE["pause_until"] - time.time()
+        if wait > 0:
+            time.sleep(min(wait, 20))
+        try:
+            info = yf.Ticker(t).info or {}
+            if info and (info.get("marketCap") or info.get("longName") or info.get("sector")):
+                _RATE["fails"] = 0
+                return {k: info.get(k) for k in INFO_KEYS}
+        except Exception as e:  # noqa: BLE001
+            if _is_rate_limit(e):
+                _RATE["fails"] += 1
+                if _RATE["fails"] >= 15:
+                    _RATE["blocked"] = True
+                _RATE["pause_until"] = max(_RATE["pause_until"], time.time() + 5 * (attempt + 1))
+                continue
+            time.sleep(0.5 * (attempt + 1))
+    return _fast_info(t)
+
+
+def fetch_fundamentals(tickers: list[str], workers: int = 4, progress=None) -> dict[str, dict]:
     CACHE_DIR.mkdir(exist_ok=True)
     cache_file = CACHE_DIR / f"info_{dt.date.today():%Y%m%d}.json"
     cache: dict[str, dict] = {}
@@ -280,15 +332,22 @@ def fetch_fundamentals(tickers: list[str], workers: int = 8) -> dict[str, dict]:
             cache = json.loads(cache_file.read_text(encoding="utf-8"))
         except Exception:
             cache = {}
-    todo = [t for t in tickers if not cache.get(t)]
+    # ดึงใหม่ทั้งตัวที่ยังไม่มี และตัวที่ได้ข้อมูลไม่ครบรอบก่อน
+    todo = [t for t in tickers if not cache.get(t) or cache[t].get("_partial")]
+    _RATE.update(pause_until=0.0, fails=0, blocked=False, deadline=time.time() + INFO_TIME_BUDGET)
     if todo:
         print(f"  ดึงงบการเงิน/ข้อมูลบริษัท {len(todo)} ตัว (cache แล้ว {len(tickers) - len(todo)}) ...")
         done = 0
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futs = {ex.submit(_fetch_info, t): t for t in todo}
             for f in as_completed(futs):
-                cache[futs[f]] = f.result()
+                t = futs[f]
+                res = f.result()
+                if res or not cache.get(t):
+                    cache[t] = res
                 done += 1
+                if progress and (done % 10 == 0 or done == len(todo)):
+                    progress(done, len(todo))
                 if done % 50 == 0 or done == len(todo):
                     print(f"    {done}/{len(todo)}")
                     cache_file.write_text(json.dumps(cache), encoding="utf-8")
@@ -547,7 +606,7 @@ def pick_top(d: pd.DataFrame, col: str, n: int, max_per_sector: int) -> pd.DataF
     ranked = d.sort_values(col, ascending=False)
     chosen, count = [], {}
     for idx, row in ranked.iterrows():
-        sec = sv(row.get("sector"), "Other")
+        sec = sv(row.get("sector"), None) or f"_{idx}"  # ไม่รู้กลุ่ม = ไม่นับรวมกับตัวอื่น
         if count.get(sec, 0) >= max_per_sector:
             continue
         chosen.append(idx)
@@ -1001,13 +1060,27 @@ def run_scan(quick: bool = False, top: int = 20, min_cap: float = 10e9, min_doll
 
     step(0.35, f"ดึงงบการเงิน/ข้อมูลบริษัท {len(d)} ตัว (ขั้นตอนนี้นานที่สุด) ...")
     log("[3/6] ดึงข้อมูลพื้นฐาน / งบการเงิน ...")
-    info = fetch_fundamentals(d.index.tolist(), workers)
+    info = fetch_fundamentals(
+        d.index.tolist(), workers,
+        progress=lambda i, n: step(0.35 + 0.38 * i / n, f"ดึงงบการเงิน/ข้อมูลบริษัท {i}/{n} ตัว ..."))
     fdf = pd.DataFrame.from_dict(info, orient="index").reindex(d.index)
-    for k in INFO_KEYS:
+    for k in INFO_KEYS + ["_partial"]:
         if k not in fdf:
             fdf[k] = np.nan
     d = d.join(fdf)
-    d = d[pd.to_numeric(d["marketCap"], errors="coerce") >= min_cap]
+    d["has_fund"] = d["sector"].notna() | d["longName"].notna()
+    mc = pd.to_numeric(d["marketCap"], errors="coerce")
+    n_fund, n_liq = int(d["has_fund"].sum()), len(d)
+    log(f"  ได้งบการเงินครบ {n_fund}/{n_liq} ตัว · มีมูลค่าตลาด {int(mc.notna().sum())} ตัว")
+    if n_fund == 0 and mc.notna().sum() == 0:
+        raise ScanError("Yahoo Finance ปฏิเสธการดึงข้อมูลบริษัททั้งหมด (จำกัดการเรียกชั่วคราว) — "
+                        "รอประมาณ 15–30 นาทีแล้วกด 'ลองใหม่'")
+    if mc.notna().mean() < 0.5:
+        # ข้อมูลมูลค่าตลาดขาดเยอะ: ใช้มูลค่าซื้อขายต่อวันสูง (หุ้นใหญ่) เป็นเกณฑ์แทนสำหรับตัวที่ขาดข้อมูล
+        keep = (mc >= min_cap) | (mc.isna() & (d["dollar_vol"] >= 150e6))
+    else:
+        keep = mc >= min_cap
+    d = d[keep]
     d = d[d["quoteType"].fillna("EQUITY") == "EQUITY"]
     log(f"  ผ่านเกณฑ์ความน่าเชื่อถือ (มูลค่าตลาด >= {fmt_cap(min_cap)}) {len(d)} ตัว")
     if len(d) == 0:
@@ -1038,7 +1111,12 @@ def run_scan(quick: bool = False, top: int = 20, min_cap: float = 10e9, min_doll
     step(0.88, "ให้คะแนนรอบสุดท้าย + คัด Top ...")
     log("[5/6] ให้คะแนนรอบสุดท้าย + คัด Top ...")
     scored = build_scores(d)
-    picks = {key: pick_top(scored, col, top, max_per_sector) for key, col, *_ in HORIZONS}
+    # รายเดือน/รายปี ใช้งบการเงินเป็นส่วนสำคัญ: เลือกเฉพาะหุ้นที่ดึงงบได้ (ถ้ามีพอ)
+    with_fund = scored[scored["has_fund"]]
+    picks = {}
+    for key, col, *_ in HORIZONS:
+        base = with_fund if (key != "week" and len(with_fund) >= top * 3) else scored
+        picks[key] = pick_top(base, col, top, max_per_sector)
 
     desc_th = {}
     if translate:
@@ -1059,6 +1137,7 @@ def run_scan(quick: bool = False, top: int = 20, min_cap: float = 10e9, min_doll
         "spy_price": float(spy.iloc[-1]), "spy_1d": float(spy.iloc[-1] / spy.iloc[-2] - 1),
         "spy_1m": float(spy.iloc[-1] / spy.iloc[-22] - 1), "spy_1y": float(spy.iloc[-1] / spy.iloc[-253] - 1),
         "regime": regime, "seconds": round(time.time() - t0),
+        "n_fund": int(scored["has_fund"].sum()),
     }
     step(1.0, "เสร็จแล้ว")
     return {"scored": scored, "picks": picks, "meta": meta, "desc_th": desc_th, "panels": panels, "spy": spy}

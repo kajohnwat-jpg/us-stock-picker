@@ -36,7 +36,7 @@ def _scan_job(key: tuple, job: dict):
     """รันสแกนใน background thread — ไม่หยุดแม้ผู้ใช้กดปุ่ม/เปลี่ยนหน้า"""
     quick, min_cap, max_sector, translate = key
     try:
-        res = sp.run_scan(quick=quick, top=20, min_cap=min_cap, max_per_sector=max_sector, workers=4,
+        res = sp.run_scan(quick=quick, top=20, min_cap=min_cap, max_per_sector=max_sector, workers=3,
                           translate=translate, progress=lambda f, m: job.update(frac=f, msg=m))
         res["ts"] = time.time()
         store()["results"][key] = res
@@ -115,6 +115,11 @@ age_min = int((time.time() - res["ts"]) / 60)
 st.caption(f"อัปเดตล่าสุด {meta['date']} น. (เวลาไทย, {age_min} นาทีที่แล้ว) · แหล่งข้อมูล Yahoo Finance · "
            f"สแกน {meta['n_scanned']} ตัว ผ่านเกณฑ์ความน่าเชื่อถือ {meta['n_pass']} ตัว "
            f"(มูลค่าตลาด ≥ {sp.fmt_cap(meta['min_cap'])}) · {md(meta['universe_src'])}")
+n_fund = meta.get("n_fund", meta["n_pass"])
+if n_fund < 0.8 * meta["n_pass"]:
+    st.warning(f"รอบนี้ดึงงบการเงินได้ {n_fund} จาก {meta['n_pass']} ตัว (Yahoo จำกัดการเรียกข้อมูลชั่วคราว) — "
+               "ลิสต์รายเดือน/รายปีเลือกเฉพาะหุ้นที่มีงบครบ ส่วนตัวที่ขาดข้อมูลจะได้คะแนนพื้นฐานกลาง ๆ "
+               f"ระบบจะลองดึงส่วนที่ขาดใหม่ในรอบถัดไป (ทุก {CACHE_HOURS} ชั่วโมง)")
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("S&P 500 (SPY)", f"${meta.get('spy_price', 0):,.2f}", sp.fmt_pct(meta.get("spy_1d"), 2))
 c2.metric("SPY 1 เดือน", sp.fmt_pct(meta["spy_1m"]))
